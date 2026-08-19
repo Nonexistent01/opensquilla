@@ -3272,6 +3272,7 @@
     "sendQueuesUntilCompaction": "Enviar (se pone en cola hasta que termine la compactación)",
     "stopResponse": "Detener respuesta actual",
     "stopResponseEsc": "Detener respuesta actual (Esc)",
+    "stoppingResponse": "Deteniendo de forma segura… Los mensajes nuevos se pondrán en cola.",
     "messageToSend": "Mensaje que enviar",
     "placeholder": "Envía un mensaje...",
     "placeholderCompact": "Mensaje...",
