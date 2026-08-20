@@ -50,7 +50,14 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"
+          :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
+          :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
+          :workbench-resource-edit-enabled="workbenchResourceEditEnabled === true"
+          :workbench-attachment-resources="workbenchAttachmentResources"
           @edit="$emit('editMessage', $event)"
+          @edit-attachment="$emit('editAttachment', $event)"
+          @preview-attachment="$emit('previewAttachment', $event)"
+          @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
         <CompactionEvent
@@ -150,6 +157,8 @@ import {
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import {
@@ -184,6 +193,10 @@ const props = defineProps<{
   sessionKey?: string
   authToken?: string
   workbenchEnabled?: boolean
+  workbenchResourcePreviewEnabled?: boolean
+  workbenchResourceEditEnabled?: boolean
+  workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
+  canReusePromptAnnotations?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
@@ -202,6 +215,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
+  editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
     settle?: (accepted: boolean) => void,

@@ -189,6 +189,46 @@ class ToolContext:
     # Process-local Goal coordinator used only by Goal-owned main-agent turns.
     # The service is never serialized into task details or route metadata.
     goal_service: Any | None = field(default=None, repr=False)
+    # Validated editor state injected only by the Web/Desktop ingress after
+    # durable turn acceptance.  These handles are process-local authority and
+    # must never be copied into route metadata, transcripts, or decision logs.
+    artifact_context: Any | None = field(default=None, repr=False)
+    artifact_session: Any | None = field(default=None, repr=False)
+    desktop_artifact_bridge: Any | None = field(default=None, repr=False)
+    artifact_event_emitter: (
+        Callable[[dict[str, Any]], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
+    # Narrow, runtime-only hook that turns a freshly published editable
+    # deliverable into the session's canonical Document before the artifact
+    # event crosses the public stream boundary. The engine never receives the
+    # underlying persistence service and adoption failures remain recoverable
+    # through the Workbench open path.
+    generated_artifact_adopter: (
+        Callable[[Any], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
+    # Hard upper bound on the tools that may be exposed or dispatched during
+    # this turn. Unlike ``allowed_tools``, declarative policy layers may never
+    # widen this set. It is used only for narrowly scoped runtime authorities
+    # such as a PromptAnnotation turn; ordinary contexts leave it unset.
+    #
+    # Runtime-only fields must remain appended here to preserve the historical
+    # positional constructor contract for embedded callers.
+    exclusive_tools: frozenset[str] | None = field(default=None, repr=False)
+    # Durable single-writer receipt controller for a PromptAnnotation turn.
+    # The Gateway constructs this only after TaskRuntime has attached the
+    # accepted task id. Dispatch consumes it before validating the first
+    # writer call; it must never be serialized or copied to another turn.
+    artifact_mutation_attempt_controller: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Process-local authority cleanup registered by ingress/runtime adapters.
+    # The shared Agent turn boundary invokes these callbacks on every terminal
+    # path without importing feature-specific tool implementations.
+    turn_cleanup_callbacks: list[Callable[[], None]] = field(
+        default_factory=list,
+        repr=False,
+    )
     # Frozen after the final provider-visible tool schema is built. Dispatch
     # and projection code use this bit to avoid replacing raw tool output with
     # a handle that the current model is not authorized to retrieve.
@@ -199,6 +239,12 @@ class ToolContext:
     parent_task_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        # A restricted turn's ceiling is an authority boundary, not a policy
+        # preference.  Normalize every caller (including embedded callers
+        # that still pass a mutable set) so no later hook can widen the live
+        # schema/dispatch ceiling in place.
+        if self.exclusive_tools is not None:
+            self.exclusive_tools = frozenset(self.exclusive_tools)
         self.validate_path_roots()
 
     def validate_path_roots(self) -> None:
@@ -293,6 +339,11 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
+        "document_apply",
+        "document_patch",
+        "document_inspect",
+        "document_locate",
+        "document_read",
     }
 )
 
@@ -361,6 +412,10 @@ class ToolSpec:
     # persisted. The dispatcher owns this behavior; handlers must not emulate
     # it with tool-name branches.
     terminates_turn: bool = False
+    # Successful terminal tools may opt in to an authoritative completion
+    # string carried in one top-level JSON result field. The dispatcher, not
+    # the model or Agent, extracts and bounds this text.
+    terminal_response_field: str | None = None
     # Trusted declaration that itemless arrays have textual wire semantics.
     # Provider policy still decides whether a request needs the projection.
     allow_string_item_schema_projection: bool = False

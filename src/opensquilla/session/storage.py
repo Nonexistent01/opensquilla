@@ -116,6 +116,7 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
+    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -510,9 +511,13 @@ def _serialized_read[**P, R](
 # and discard tombstones. Version 19 added the generation-fenced current Goal
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
 # message anchor used by reconnect-safe transcript presentation. Version 21
-# added the bounded durable pending-chat-input outbox. Version 22 added the
-# persistent per-session model-routing mode and its compare-and-set revision.
-SCHEMA_VERSION = 22
+# added the bounded durable pending-chat-input outbox.
+# Version 22 added durable ArtifactSession documents, immutable revisions,
+# change sets, editor sessions, anchors, and audit events. Version 23 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 24 added
+# durable idempotency receipts for artifact mutation attempts. Version 25 added
+# the persistent per-session model-routing mode and its compare-and-set revision.
+SCHEMA_VERSION = 25
 MAX_PENDING_CHAT_INPUTS = 5
 
 # These fields have their own atomic resolver/CAS API.  Whole-session writes
@@ -1719,6 +1724,7 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._connection_generation = 0
         self._transcript_reader: Any | None = None
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
@@ -1789,6 +1795,7 @@ class SessionStorage:
             await self.close()
         self._poisoned = False
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._connection_generation += 1
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
         # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
@@ -2121,6 +2128,35 @@ class SessionStorage:
         finally:
             if acquired:
                 self._operation_lock.release()
+
+    @property
+    def connection_generation(self) -> int:
+        """Monotonic identity for consumers that cache per-connection setup."""
+
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        return self._connection_generation
+
+    @asynccontextmanager
+    async def read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Run a bounded read snapshot on the canonical connection.
+
+        The operation gate prevents interleaving transactions on the shared
+        aiosqlite connection.  A deferred ``BEGIN`` intentionally avoids
+        reserving SQLite's writer slot, so independent WAL writers remain
+        available while the short snapshot runs.
+        """
+
+        qualified_operation = f"read.{operation}"
+        async with self._operation_lock:
+            self._raise_if_poisoned()
+            conn = self.conn
+            try:
+                await self._finish_sqlite_call(conn.execute("BEGIN"))
+                yield conn
+            finally:
+                if bool(getattr(conn, "in_transaction", False)):
+                    await self._rollback_transaction(conn, qualified_operation)
 
     async def _initialize_schema(
         self,
@@ -5308,6 +5344,16 @@ class SessionStorage:
         conn: aiosqlite.Connection,
         session: SessionNode,
     ) -> None:
+        from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+        # ArtifactSession state is fenced and removed inside the same durable
+        # boundary as the owning session.  A failure aborts the whole delete;
+        # post-commit filesystem cleanup is intentionally handled separately.
+        await purge_session_on_connection(
+            conn,
+            session_id=session.session_id,
+            boundary="session_delete",
+        )
         for table in (
             "transcript_entries",
             "compacted_transcript_entries",
@@ -11966,6 +12012,14 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
+            from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+            await purge_session_on_connection(
+                conn,
+                session_id=expected_session_id,
+                boundary="session_reset",
+            )
+
             assignments = [
                 f"{column} = ?"
                 for column in session_data
@@ -12054,6 +12108,9 @@ class SessionStorage:
             )
 
         _clear_pending_meta_launch_boundary(node.session_key)
+        from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+        await run_session_artifact_cleanup(expected_session_id, node.session_key)
 
     async def accept_turn(
         self,
@@ -12083,6 +12140,9 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
+        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
+        prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
         pending_input_revision: int | None = None,
@@ -12126,6 +12186,24 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
+        expected_prompt_annotations = tuple(expected_prompt_annotations)
+        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
+        if expected_prompt_annotations and prepared_prompt_annotation_targets:
+            raise ValueError(
+                "prompt annotation acceptance cannot use legacy and prepared inputs together"
+            )
+        prompt_annotation_acceptance = bool(
+            expected_prompt_annotations or prepared_prompt_annotation_targets
+        )
+        if prompt_annotation_acceptance:
+            if session_node is not None or merge_into_task:
+                raise ValueError(
+                    "prompt annotations require an existing session and a distinct turn"
+                )
+            if not isinstance(prompt_annotation_turn_id, str) or not (
+                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
+            ):
+                raise ValueError("prompt_annotation_turn_id is required")
         pending_guard_values = (
             pending_input_id,
             pending_input_fingerprint,
@@ -12396,6 +12474,35 @@ class SessionStorage:
                     ),
                 )
 
+            if prompt_annotation_acceptance:
+                from opensquilla.artifact_session import (
+                    consume_prepared_prompt_annotations_on_conn,
+                    consume_prompt_annotations_on_conn,
+                )
+
+                assert prompt_annotation_turn_id is not None
+                if prepared_prompt_annotation_targets:
+                    await consume_prepared_prompt_annotations_on_conn(
+                        conn,
+                        prepared_targets=prepared_prompt_annotation_targets,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+                else:
+                    await consume_prompt_annotations_on_conn(
+                        conn,
+                        expected_annotations=expected_prompt_annotations,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -12635,6 +12742,15 @@ class SessionStorage:
                     if reset_archive_writer is not None:
                         await reset_archive_writer(reset_archive_snapshot)
                         reset_archive_snapshot = None
+                    from opensquilla.artifact_session.lifecycle import (
+                        purge_session_on_connection,
+                    )
+
+                    await purge_session_on_connection(
+                        conn,
+                        session_id=reset_from_session_id,
+                        boundary="session_reset",
+                    )
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
@@ -13363,6 +13479,9 @@ class SessionStorage:
                 preserve_client_request_id=client_request_id,
                 preserve_message=entry.content,
             )
+            from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+            await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
         return acceptance_result
 
     async def _fetchall_transcript_rows(self, cursor: Any) -> list[Any]:

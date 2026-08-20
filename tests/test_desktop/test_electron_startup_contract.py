@@ -91,6 +91,31 @@ def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
     assert "'0.0.0.0'" not in start_gateway
 
 
+def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    child_environment = _section(
+        main_ts,
+        "function desktopChildEnvironment",
+        "// ── Legacy home import detection",
+    )
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]" in child_environment
+    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]" in child_environment
+    assert "await desktopArtifactBridgeLoopback.start()" in start_gateway
+    assert "...artifactBridgeEnvironment" in start_gateway
+    assert start_gateway.index("await desktopArtifactBridgeLoopback.start()") < start_gateway.index(
+        "const port = await findGatewayPort()"
+    )
+    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL" not in preload
+    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN" not in preload
+
+
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 
@@ -1048,17 +1073,18 @@ def test_consolidated_safe_storage_failure_cannot_publish_or_ack_as_adopted() ->
     # safeStorage can throw while decrypting ciphertext from another OS
     # keychain. Keep the candidate local to the guarded try until both secrets
     # have been validated, so the catch path leaves the publish guard null.
-    assert "return safeStorage.decryptString(payload)" in decrypt_secret
+    assert "() => safeStorage.decryptString(payload)" in decrypt_secret
+    assert "decryptedSecretCache.resolve(" in decrypt_secret
 
     candidate_index = credential_adoption.index(
         "const candidateCredential = normalizeDesktopCredential("
     )
     provider_validation_index = credential_adoption.index(
-        "!decryptApiKey(candidateCredential)",
+        "resolvedCredentialApiKey = decryptApiKey(candidateCredential)",
         candidate_index,
     )
     search_validation_index = credential_adoption.index(
-        "!decryptSearchApiKey(candidateCredential)",
+        "resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)",
         provider_validation_index,
     )
     publish_eligibility_index = credential_adoption.index(
@@ -1582,7 +1608,9 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "await waitForGateway(url, () => childExitMessage)" in start
     assert "waitForGatewayReadiness({" in wait
     assert "primaryTimeoutMs: 45_000" in wait
-    assert "lateGraceMs: 15_000" in wait
+    assert (
+        "lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000" in wait
+    )
     assert "exitMessage: earlyExitMessage" in wait
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
 
@@ -2360,6 +2388,28 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "preservedDraft" in recovery
 
 
+def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electron() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    gate = _read("desktop/electron/scripts/test-offline-document-workbench-e2e.mjs")
+    native = _read("desktop/electron/scripts/test-native-workbench-v2-electron.mjs")
+    ci = _read(".github/workflows/ci.yml")
+
+    assert (
+        package_json["scripts"]["test:offline-document-workbench-e2e"]
+        == "npm run build && node scripts/test-offline-document-workbench-e2e.mjs"
+    )
+    assert "test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable" in gate
+    assert "test-native-workbench-v2-electron.mjs" in gate
+    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND: '1'" in gate
+    assert "owned-Gateway WebSocket lifecycle" in gate
+    assert "real Electron process" in gate
+    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
+    assert "requires an unlocked foreground GUI session" in native
+    assert ci.count(
+        "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
+    ) == 2
+
+
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
     build_gateway = _read("desktop/electron/scripts/build-gateway.mjs")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")
@@ -2578,6 +2628,38 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
     assert "DESKTOP_LOG_MAX_BYTES" in log_file
     assert "DESKTOP_LOG_BACKUP_COUNT" in log_file
     assert "appendDesktopLogRecord" in main_ts
+
+
+def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    create_window = _section(
+        main_ts,
+        "async function createMainWindow(): Promise<BrowserWindow>",
+        "async function loadControlUi",
+    )
+    cleanup = _section(
+        create_window,
+        "const releaseRendererOwnedArtifactPreviews = (): void => {",
+        "// Forward renderer console errors",
+    )
+    renderer_gone = _section(
+        create_window,
+        "window.webContents.on('render-process-gone'",
+        "window.webContents.on('unresponsive'",
+    )
+    full_navigation = _section(
+        create_window,
+        "window.webContents.on('did-start-navigation'",
+        "window.on('close'",
+    )
+
+    assert "void nativeWorkbenchSurfaces.destroyAll()" in cleanup
+    assert "void artifactPreviewLeaseBroker.revokeAll()" in cleanup
+    assert "releaseRendererOwnedArtifactPreviews()" in renderer_gone
+    assert (
+        "if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()"
+        in full_navigation
+    )
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:

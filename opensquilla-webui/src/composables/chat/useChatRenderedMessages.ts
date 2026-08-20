@@ -366,7 +366,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       // while retaining their provider-facing text in the transcript. They
       // still establish a new turn identity for the following router and
       // assistant rows, but must not leave an empty user bubble in the UI.
-      if (msg.role === 'user' && !msg.text.trim() && !msg.attachments?.length) {
+      if (
+        msg.role === 'user'
+        && !msg.text.trim()
+        && !msg.attachments?.length
+        && !msg.promptAnnotations?.length
+      ) {
         prevRole = ''
         continue
       }
@@ -530,6 +535,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnOutcome: msg.turnOutcome,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,
+        promptAnnotations: msg.promptAnnotations,
         createdSessionLinks: createdSessionLinksFromCalls(normalizedToolCalls),
         // submit_plan is a transport/control detail. Once a typed immutable
         // plan part exists, the plan card is the authoritative visible item;

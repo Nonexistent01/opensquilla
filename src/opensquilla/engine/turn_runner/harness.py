@@ -588,6 +588,19 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             capabilities = runner._model_catalog.get_capabilities(
                 model_id, provider_name=provider_name, base_url=base_url
             )
+            capability_verifier = getattr(
+                runner._model_catalog,
+                "tool_capability_is_verified",
+                None,
+            )
+            tools_capability_verified = bool(
+                callable(capability_verifier)
+                and capability_verifier(
+                    model_id,
+                    provider_name=provider_name,
+                    base_url=base_url,
+                )
+            )
             deployment_vision_resolver = getattr(
                 runner._model_catalog,
                 "resolve_deployment_vision_support",
@@ -622,6 +635,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             auto_max_tokens_source = "default"
             context_window = user_context_window if user_context_window > 0 else 200_000
             capabilities = None
+            tools_capability_verified = False
             vision_support = "unknown"
         if vision_support not in {"supported", "unsupported", "unknown"}:
             vision_support = "unknown"
@@ -629,6 +643,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            tools_capability_verified=tools_capability_verified,
             vision_support=cast(Any, vision_support),
             context_window_tokens_global_override=user_context_window,
             auto_max_tokens=auto_max_tokens,
@@ -696,6 +711,20 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
                 base_url=base_url,
             )
         )
+        deployment_tool_verifier = getattr(
+            catalog,
+            "deployment_tool_capability_is_verified",
+            None,
+        )
+        tools_capability_verified = bool(
+            callable(deployment_tool_verifier)
+            and deployment_tool_verifier(
+                model_id,
+                provider=provider_name,
+                api_key=str(getattr(deployment, "api_key", "") or ""),
+                base_url=base_url,
+            )
+        )
         deployment_vision_resolver = getattr(
             catalog,
             "resolve_deployment_vision_support",
@@ -732,6 +761,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            tools_capability_verified=tools_capability_verified,
             vision_support=cast(Any, vision_support),
             auto_max_tokens=limits.max_output_tokens,
             auto_max_tokens_known=limits.max_output_tokens_known,
@@ -1250,6 +1280,7 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
+        restricted_turn: bool = False,
         transcript_snapshot: Any | None = None,
     ) -> str | None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
@@ -1258,6 +1289,8 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
             "trim_last_user": trim_last_user,
             "bound_user_message_id": bound_user_message_id,
         }
+        if _accepts_keyword_arg(self._runner._load_history, "restricted_turn"):
+            kwargs["restricted_turn"] = restricted_turn
         if transcript_snapshot is not None and _accepts_keyword_arg(
             self._runner._load_history,
             "transcript_snapshot",
@@ -1497,12 +1530,24 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         session_key: str,
         bootstrap_context_mode: str | None,
     ) -> None:
+        restricted_tool_boundary = bool(
+            getattr(agent, "_tool_context", None) is not None
+            and getattr(agent._tool_context, "exclusive_tools", None) is not None
+        )
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
             session_key=session_key,
-            bootstrap_context_mode=bootstrap_context_mode,
-            workspace_dir=getattr(agent.config, "workspace_dir", None),
+            bootstrap_context_mode=(
+                "restricted_tool_boundary"
+                if restricted_tool_boundary
+                else bootstrap_context_mode
+            ),
+            workspace_dir=(
+                None
+                if restricted_tool_boundary
+                else getattr(agent.config, "workspace_dir", None)
+            ),
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled

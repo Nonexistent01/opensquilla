@@ -571,21 +571,32 @@ def apply_model_override(
                 "capacity for this attachment request."
             ),
         )
-        bounded_provider_override = getattr(
-            selector,
-            "override_provider_config_with_bounded_fallbacks",
-            None,
-        )
-        if (
-            _bounded_fallback_chain_required(turn_metadata)
-            and callable(bounded_provider_override)
-        ):
-            bounded_provider_override(
-                tier_provider_config,
-                _capacity_approved_configured_fallbacks(selector, turn_metadata),
-            )
+        if turn_metadata.get("router_fallback_strict") is True:
+            try:
+                selector.override_provider_config(
+                    tier_provider_config,
+                    preserve_existing_tail=False,
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "selector does not support strict artifact fallback isolation"
+                ) from exc
         else:
-            selector.override_provider_config(tier_provider_config)
+            bounded_provider_override = getattr(
+                selector,
+                "override_provider_config_with_bounded_fallbacks",
+                None,
+            )
+            if (
+                _bounded_fallback_chain_required(turn_metadata)
+                and callable(bounded_provider_override)
+            ):
+                bounded_provider_override(
+                    tier_provider_config,
+                    _capacity_approved_configured_fallbacks(selector, turn_metadata),
+                )
+            else:
+                selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -669,7 +680,23 @@ def apply_model_override(
         None,
     )
     bounded_fallbacks_required = _bounded_fallback_chain_required(turn_metadata)
-    if bounded_fallbacks_required and callable(override_with_bounded_fallback_chain):
+    if (
+        turn_metadata.get("router_fallback_strict") is True
+        and callable(override_with_fallback_chain)
+        and isinstance(router_fallback_chain, list)
+    ):
+        try:
+            override_with_fallback_chain(
+                model,
+                router_fallback_chain,
+                preserve_existing_tail=False,
+            )
+        except TypeError:
+            # Compatibility for third-party selector shims that implement
+            # the older two-argument hook. A strict Artifact turn must not
+            # silently retain their unknown fallback tail.
+            selector.override_model(model)
+    elif bounded_fallbacks_required and callable(override_with_bounded_fallback_chain):
         approved_router_fallbacks = _capacity_approved_fallback_entries(
             selector,
             router_fallback_chain if isinstance(router_fallback_chain, list) else [],

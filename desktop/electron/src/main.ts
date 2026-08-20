@@ -35,6 +35,7 @@ import {
   DesktopGatewayOwnershipVerificationCoordinator,
 } from './desktop-gateway-ownership-verification.js'
 import {
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -58,6 +59,7 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { SecretDecryptionCache } from './secret-decryption-cache.js'
 import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
   GITHUB_UPDATE_OWNER,
@@ -114,6 +116,17 @@ import {
 import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
+import {
+  parseNativeWorkbenchAnnotationModeRequest,
+  parseNativeWorkbenchAnnotationOverlayCloseRequest,
+  parseNativeWorkbenchAnnotationOverlayShowRequest,
+} from './native-workbench-annotation-contract.js'
+import { DesktopArtifactBridge } from './desktop-artifact-bridge.js'
+import {
+  DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
+  DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
+  DesktopArtifactBridgeLoopbackTransport,
+} from './desktop-artifact-bridge-loopback.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
@@ -499,6 +512,7 @@ const onboardingFlows = new OnboardingFlowCoordinator<
   OnboardingFlow
 >()
 let secretStorageBackendCache: SecretEncryption | null = null
+const decryptedSecretCache = new SecretDecryptionCache()
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
   phaseId: 'profile',
@@ -585,6 +599,20 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     window.webContents.send('desktop:workbench:surface-event', event)
   },
 })
+const desktopArtifactBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
+})
+const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
+  desktopArtifactBridge,
+  {
+    audit: entry => desktopLog(entry.event, {
+      operation: entry.operation,
+      outcome: entry.outcome,
+      code: entry.code,
+      durationMs: entry.durationMs,
+    }),
+  },
+)
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -644,6 +672,11 @@ function desktopChildEnvironment(
   additions: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
+  // Never let inherited/stale bridge credentials flow into helper, recovery,
+  // probe, or migration children. startGateway adds its freshly generated
+  // process-lifetime credentials only to the owned Gateway spawn.
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]
   return {
     ...environment,
     ...additions,
@@ -1927,9 +1960,40 @@ function decryptSecret(encryptedValue: string | undefined, encryption: SecretEnc
     if (desktopSecretStorageBackend() !== 'safeStorage') {
       throw new Error('Saved desktop credential requires macOS Keychain, but this local build uses plain credential storage.')
     }
-    return safeStorage.decryptString(payload)
+    return decryptedSecretCache.resolve(
+      activeDesktopProfile().home,
+      encryptedValue,
+      encryption,
+      () => safeStorage.decryptString(payload),
+    )
   }
   return payload.toString('utf8')
+}
+
+function rememberDecryptedCredentialSecrets(
+  record: DesktopConnection,
+  apiKey: string,
+  searchApiKey: string,
+  profile = activeDesktopProfile(),
+): void {
+  if (record.encryption !== 'safeStorage') return
+  const profileScope = profile.home
+  if (record.encryptedApiKey && apiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedApiKey,
+      record.encryption,
+      apiKey,
+    )
+  }
+  if (record.encryptedSearchApiKey && searchApiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedSearchApiKey,
+      record.encryption,
+      searchApiKey,
+    )
+  }
 }
 
 function decryptApiKey(record: DesktopConnection): string {
@@ -2384,6 +2448,12 @@ async function saveDesktopCredential(
       writerReserved,
       configLocale,
     )
+    rememberDecryptedCredentialSecrets(
+      credential,
+      resolvedApiKey,
+      resolvedSearchApiKey,
+      targetProfile,
+    )
     return credential
   } finally {
     finishWriter()
@@ -2435,6 +2505,7 @@ async function saveImportedDesktopCredential(
     throw new Error('A gateway is still serving this profile; stop it before adopting credentials.')
   }
   const credential = buildImportedDesktopCredential(prefill, importTransactionId, apiKeyOverride)
+  const candidateCredential = JSON.stringify(credential, null, 2)
   const finishWriter = writerReserved
     ? () => {}
     : beginDesktopWriterOperation('adopt imported desktop credential')
@@ -2453,7 +2524,7 @@ async function saveImportedDesktopCredential(
         expected_config: importedConfig,
         config: importedConfig,
         expected_credential: expectedCredential,
-        credential: JSON.stringify(credential, null, 2),
+        credential: candidateCredential,
       }),
       true,
     )
@@ -2463,8 +2534,10 @@ async function saveImportedDesktopCredential(
     if (result.outcome === 'recovery_required') {
       throw new Error(`Imported credential was not adopted (${result.stable_code}).`)
     }
-    const readback = await loadDesktopCredential()
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     const expectedKey = apiKeyOverride.trim() || prefill.apiKey.trim()
+    rememberDecryptedCredentialSecrets(credential, expectedKey, '', profile)
+    const readback = await loadDesktopCredential()
     if (
       !readback
       || readback.configAuthority !== 'profile'
@@ -2677,6 +2750,7 @@ async function applyDesktopSettingsPair(
     if (!restartSafe) {
       throw new Error(`Desktop settings were not applied (${result.stable_code}).`)
     }
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     return result
   } finally {
     if (ownedGatewayWasRunning && desktopProfileKey() === targetProfileKey) {
@@ -7413,6 +7487,8 @@ async function adoptConsolidatedDesktopCredential(
       disposition = 'primary_exists'
     } else {
       let credential: DesktopConnection | null = null
+      let resolvedCredentialApiKey = ''
+      let resolvedCredentialSearchApiKey = ''
       let credentialPhase: 'parse' | 'decrypt' = 'parse'
       try {
         const raw = sourceCredential
@@ -7461,16 +7537,12 @@ async function adoptConsolidatedDesktopCredential(
         // Validate OS-keychain ciphertext before publishing it at the primary path.
         // Unusable historical secrets are skipped so normal onboarding can collect
         // a fresh credential instead of permanently blocking every startup.
-        if (
-          candidateCredential.encryptedApiKey
-          && !decryptApiKey(candidateCredential)
-        ) {
+        resolvedCredentialApiKey = decryptApiKey(candidateCredential)
+        if (candidateCredential.encryptedApiKey && !resolvedCredentialApiKey) {
           throw new Error('provider credential decrypted to an empty value')
         }
-        if (
-          candidateCredential.encryptedSearchApiKey
-          && !decryptSearchApiKey(candidateCredential)
-        ) {
+        resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)
+        if (candidateCredential.encryptedSearchApiKey && !resolvedCredentialSearchApiKey) {
           throw new Error('search credential decrypted to an empty value')
         }
         // Publish eligibility is assigned only after both safeStorage/plaintext
@@ -7538,9 +7610,20 @@ async function adoptConsolidatedDesktopCredential(
           }
         }
         // Force the normal loader to validate the bytes at their final primary path.
-        if (!await loadDesktopCredential()) {
+        const publishedCredential = await loadDesktopCredential()
+        if (!publishedCredential) {
           throw new Error('The consolidated Desktop credential was not published.')
         }
+        // Publishing replaces the primary credential authority. Drop every
+        // previous-profile/value reference, then retain only the secrets that
+        // were successfully validated for the published ciphertext above.
+        decryptedSecretCache.clear()
+        rememberDecryptedCredentialSecrets(
+          publishedCredential,
+          resolvedCredentialApiKey,
+          resolvedCredentialSearchApiKey,
+          primary,
+        )
         desktopLog('desktop_profile_consolidation_credential_adopted', {
           sourceRecoveryId,
         })
@@ -7839,7 +7922,7 @@ async function waitForGateway(url: string, earlyExitMessage?: () => string | nul
     probe: (remainingMs) => healthCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
-    lateGraceMs: 15_000,
+    lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
     pollIntervalMs: 500,
   })
   if (result.status === 'ready') {
@@ -8185,6 +8268,18 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('gateway-start')
   const runtime = await resolveGatewayRuntime()
 
+  // Start the main-process-only bridge before the final port-selection await.
+  // Its random endpoint and 256-bit token are injected only into this owned
+  // Gateway child below; they are never copied into the renderer environment.
+  let artifactBridgeEnvironment: NodeJS.ProcessEnv = {}
+  try {
+    artifactBridgeEnvironment = await desktopArtifactBridgeLoopback.start()
+  } catch {
+    // The editor transport is additive. If loopback binding is unavailable,
+    // keep the Gateway and download/source workflows usable with every native
+    // capability disabled instead of weakening the transport boundary.
+    desktopLog('desktop_artifact_bridge_transport_unavailable')
+  }
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -8238,6 +8333,7 @@ async function startGateway(): Promise<GatewayState> {
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
+    ...artifactBridgeEnvironment,
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
@@ -8475,6 +8571,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       desktopLog(entry.event, entry.detail)
     }
   }
+  const releaseRendererOwnedArtifactPreviews = (): void => {
+    void nativeWorkbenchSurfaces.destroyAll()
+    void artifactPreviewLeaseBroker.revokeAll()
+  }
 
   // Forward renderer console errors to desktop.log. The Control UI runs
   // in the renderer, so a purely front-end failure (a thrown error, an unhandled
@@ -8502,6 +8602,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // the reason and exit code gives a first, always-present breadcrumb.
   window.webContents.on('render-process-gone', (_event, details) => {
     flushRendererConsoleSuppression()
+    releaseRendererOwnedArtifactPreviews()
     const entry = buildRendererGoneLogEntry({
       reason: details.reason,
       exitCode: details.exitCode,
@@ -8556,7 +8657,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     // must remove them before boot/recovery/another Control UI can become
     // visible; same-document SPA navigation keeps the Workbench lifecycle in
     // Vue and is intentionally left alone.
-    if (isMainFrame && !isInPlace) void nativeWorkbenchSurfaces.destroyAll()
+    if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()
   })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
@@ -10746,6 +10847,68 @@ ipcMain.handle('desktop:workbench:capabilities', (event) => {
     ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
     : NATIVE_WORKBENCH_CAPABILITIES
 })
+ipcMain.handle('desktop:workbench:artifact:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return desktopArtifactBridge.getCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:capabilities', async (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  return await nativeWorkbenchSurfaces.getArtifactAnnotationCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:set-mode', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.setArtifactAnnotationMode(
+      parseNativeWorkbenchAnnotationModeRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:show-overlay', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.showArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayShowRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:close-overlay', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:artifact:capture-selection', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.captureSelection(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-inspect', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserInspect(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-act', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserAct(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:screenshot', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.screenshot(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:office-flush', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.officeFlush(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.reloadSurface(payload)
+})
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   return await artifactPreviewLeaseBroker.create(payload)
@@ -10762,16 +10925,19 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
-    if (
-      request.kind === 'artifact-preview'
-      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
-    ) {
-      return {
-        ok: false,
-        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+    let activePreviewArtifactId: string | null = null
+    if (request.kind === 'artifact-preview') {
+      activePreviewArtifactId = artifactPreviewLeaseBroker.resolveSurfaceArtifactId(
+        request.payload,
+      )
+      if (!activePreviewArtifactId) {
+        return {
+          ok: false,
+          message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+        }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request)
+    return await nativeWorkbenchSurfaces.createSurface(request, activePreviewArtifactId)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
@@ -11047,6 +11213,9 @@ async function restoreAfterIncompleteCleanup(
   preserveControlUi = false,
 ): Promise<void> {
   isQuitting = false
+  // A partial cleanup may already have replaced or removed credential bytes.
+  // Never carry a pre-cleanup plaintext reference into the recovered profile.
+  decryptedSecretCache.clear()
   clearReusableGatewayState()
   const inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
@@ -11152,6 +11321,7 @@ async function applyApprovedDesktopCleanup(
         refreshed.scope_fingerprint,
         report,
       )
+      decryptedSecretCache.clear()
       shouldQuit = true
       return { ok: true, scheduled: true, report }
     }
@@ -11165,6 +11335,7 @@ async function applyApprovedDesktopCleanup(
       '--json',
     ])
     if (result.outcome === 'complete') {
+      decryptedSecretCache.clear()
       if (report.mode === 'reset-current-settings') {
         transientPendingMigrationProviderSetup = null
         forceOnboardingOnNextStartup = true
@@ -12395,6 +12566,10 @@ ipcMain.handle('desktop:migration:run', async (
         )
         if (receipt) {
           migrationApplied = true
+          // The imported target is now authoritative, even if subsequent
+          // credential reconciliation needs onboarding. Discard any plaintext
+          // resolved from the profile that existed before the import.
+          decryptedSecretCache.clear()
           if (!migrationVerified) report = receipt.report
           // Publication of a validated, previously-unseen target receipt is the
           // durable commit authority. The CLI child can lose stdout or exit
@@ -13181,6 +13356,7 @@ app.on('before-quit', (event) => {
     isQuitting = true
     setAppExitPhase('committed', 'Windows session ending')
     destroyWindowsTray()
+    void desktopArtifactBridgeLoopback.close()
     stopGateway()
     return
   }
@@ -13192,6 +13368,7 @@ app.on('before-quit', (event) => {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
       destroyWindowsTray()
+      void desktopArtifactBridgeLoopback.close()
       return
     }
     event.preventDefault()
@@ -13256,6 +13433,7 @@ app.on('before-quit', (event) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
         destroyWindowsTray()
+        void desktopArtifactBridgeLoopback.close()
         app.exit(0)
         return
       }
@@ -13281,6 +13459,7 @@ app.on('before-quit', (event) => {
   }
   setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
   destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
   stopGateway()
 })
 
@@ -13305,7 +13484,10 @@ app.on('activate', () => {
   revealDesktopApp()
 })
 
-app.on('will-quit', destroyWindowsTray)
+app.on('will-quit', () => {
+  destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
+})
 
 configureChromiumKeychainPolicy()
 

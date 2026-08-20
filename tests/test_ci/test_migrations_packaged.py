@@ -60,6 +60,20 @@ def test_wheel_contains_migrations_and_webui_artifact(
         n.endswith("opensquilla/_migrations/V032__meta_launch_discard_tombstones.py")
         for n in names
     ), f"V032 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V037__artifact_sessions.py") for n in names
+    ), f"V037 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V038__artifact_prompt_annotations.py")
+        for n in names
+    ), f"V038 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V039__artifact_mutation_attempts.py")
+        for n in names
+    ), f"V039 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V040__document_resources.py") for n in names
+    ), f"V040 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert "opensquilla/gateway/static/dist/index.html" in names
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
@@ -149,6 +163,14 @@ def test_installed_wheel_resolves_migrations(
                 "        f'V031 missing in {d}';"
                 " assert (d / 'V032__meta_launch_discard_tombstones.py').exists(),"
                 "        f'V032 missing in {d}';"
+                " assert (d / 'V037__artifact_sessions.py').exists(),"
+                "        f'V037 missing in {d}';"
+                " assert (d / 'V038__artifact_prompt_annotations.py').exists(),"
+                "        f'V038 missing in {d}';"
+                " assert (d / 'V039__artifact_mutation_attempts.py').exists(),"
+                "        f'V039 missing in {d}';"
+                " assert (d / 'V040__document_resources.py').exists(),"
+                "        f'V040 missing in {d}';"
                 " print('OK', d)"
             ),
         ],
@@ -205,6 +227,10 @@ def test_docker_image_resolves_migrations() -> None:
                 " assert (d / 'V030__meta_control_intents.py').exists();"
                 " assert (d / 'V031__meta_launch_drafts.py').exists();"
                 " assert (d / 'V032__meta_launch_discard_tombstones.py').exists();"
+                " assert (d / 'V037__artifact_sessions.py').exists();"
+                " assert (d / 'V038__artifact_prompt_annotations.py').exists();"
+                " assert (d / 'V039__artifact_mutation_attempts.py').exists();"
+                " assert (d / 'V040__document_resources.py').exists();"
                 " print('OK', d)"
             ),
         ],

@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="0"
+          :failure-count="documentApplyFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -818,6 +818,7 @@ function withoutFailedActivity(
 ): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
     )
@@ -827,24 +828,33 @@ function withoutFailedActivity(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentApplyGroup
     ) {
       return []
     }
     const calls = item.group.calls.filter(
-      call => !call.isError
-        && call.status !== 'error'
-        && !createdSessionCallIds.value.has(call.toolId),
+      call => (
+        (
+          (!call.isError && call.status !== 'error')
+          || isDocumentApplyToolName(call.name)
+        )
+        && !createdSessionCallIds.value.has(call.toolId)
+      ),
     )
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -852,6 +862,13 @@ function withoutFailedActivity(
       },
     }]
   })
+}
+
+function isDocumentApplyToolName(value: string | undefined): boolean {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  const segments = normalized.split(/[.:/]/)
+  return segments[segments.length - 1] === 'document_apply'
 }
 
 const visibleActivityItems = computed(() =>
@@ -869,7 +886,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    !cluster.isFailure
+    (!cluster.isFailure || cluster.calls.some(call => isDocumentApplyToolName(call.name)))
     && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
@@ -897,6 +914,20 @@ const hasActivity = computed(() =>
 const showActivityDisclosure = computed(() =>
   activityProjection.value.canSeparateActivity
   && hasActivity.value,
+)
+
+const documentApplyFailureCount = computed(() =>
+  visibleActivityItems.value.reduce((count, item) => {
+    if (item.type !== 'tool-group') return count
+    return count + item.group.calls.filter(call =>
+      isDocumentApplyToolName(call.name)
+      && (call.isError || call.status === 'error'),
+    ).length
+  }, 0),
+)
+
+const documentMutationOutcome = computed(() =>
+  props.message.turnOutcome?.documentMutationOutcome,
 )
 
 const activityStepCount = computed(() => Math.max(
@@ -1052,6 +1083,20 @@ function withMaintenanceSummary(label: string): string {
 }
 
 const activitySummaryLabel = computed(() => {
+  const mutationStatus = documentMutationOutcome.value?.status
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
+  if (mutationSummaryKey) {
+    return withMaintenanceSummary([
+      String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',

@@ -1,10 +1,18 @@
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
 import pytest
 
 import opensquilla.gateway.rpc_chat as rpc_chat_module
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
@@ -1167,6 +1175,196 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
 
 
 @pytest.mark.asyncio
+async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-mutation-ledger.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:mutation-ledger"
+    foreign_session_key = "agent:main:webchat:mutation-ledger-foreign"
+    await manager.create(session_key)
+    await manager.create(foreign_session_key)
+    service = await ArtifactSessionService.from_session_storage(storage)
+    actor = Actor(ActorKind.AGENT, "agent-1")
+
+    def blob(label: str) -> ArtifactBlobRef:
+        payload = label.encode()
+        return ArtifactBlobRef(
+            artifact_id=f"artifact-{label}",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            filename=f"{label}.html",
+            media_type="text/html",
+            byte_size=len(payload),
+        )
+
+    async def reserve(turn_id: str, *, owner_session_key: str = session_key):
+        created = await service.create_document(
+            session_key=owner_session_key,
+            session_id=f"session-{turn_id}",
+            name=turn_id,
+            kind=ArtifactKind.HTML,
+            initial_artifact=blob(f"base-{turn_id}"),
+            actor=actor,
+        )
+        attempt = await service.reserve_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            tool_use_id=f"tool-{turn_id}",
+            base_revision_id=created.revision.revision_id,
+            proposal_sha256=hashlib.sha256(turn_id.encode()).hexdigest(),
+        )
+        return created, attempt
+
+    try:
+        applied_document, _ = await reserve("turn-ledger-applied")
+        applied_change = await service.create_change_set(
+            document_id=applied_document.document.document_id,
+            base_revision_id=applied_document.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=actor,
+            turn_id="turn-ledger-applied",
+        )
+        ready_change = await service.ready_change_set(
+            change_set_id=applied_change.change_set_id,
+            expected_state_revision=applied_change.state_revision,
+            candidate_artifact=blob("result-turn-ledger-applied"),
+            actor=actor,
+        )
+        applied_result = await service.apply_change_set(
+            change_set_id=ready_change.change_set_id,
+            expected_change_set_state_revision=ready_change.state_revision,
+            expected_head_revision_id=applied_document.revision.revision_id,
+            expected_document_state_revision=applied_document.document.state_revision,
+            actor=actor,
+        )
+        applied_attempt = await service.mark_mutation_attempt_applied(
+            document_id=applied_document.document.document_id,
+            turn_id="turn-ledger-applied",
+            tool_use_id="tool-turn-ledger-applied",
+            change_set_id=applied_change.change_set_id,
+            revision_id=applied_result.revision.revision_id,
+        )
+
+        failed_document, _ = await reserve("turn-ledger-failed")
+        failed_attempt = await service.mark_mutation_attempt_failed(
+            document_id=failed_document.document.document_id,
+            turn_id="turn-ledger-failed",
+            tool_use_id="tool-turn-ledger-failed",
+            failure_code="restart_commit_not_applied",
+        )
+        ambiguous_document, _ = await reserve("turn-ledger-ambiguous")
+        ambiguous_attempt = await service.mark_mutation_attempt_ambiguous(
+            document_id=ambiguous_document.document.document_id,
+            turn_id="turn-ledger-ambiguous",
+            tool_use_id="tool-turn-ledger-ambiguous",
+            failure_code="restart_commit_outcome_unknown",
+        )
+        _reserved_document, reserved_attempt = await reserve("turn-ledger-reserved")
+        await reserve("turn-ledger-foreign", owner_session_key=foreign_session_key)
+
+        local_turns = (
+            "turn-ledger-applied",
+            "turn-ledger-failed",
+            "turn-ledger-ambiguous",
+            "turn-ledger-reserved",
+            "turn-ledger-foreign",
+        )
+        for index, turn_id in enumerate(local_turns, start=1):
+            with turn_context_scope({"turn_id": turn_id}):
+                await manager.append_message(session_key, "user", f"prompt {index}")
+
+        task_claims = {
+            "turn-ledger-applied": "not_applied",
+            "turn-ledger-failed": "applied",
+            "turn-ledger-ambiguous": "not_applied",
+        }
+        for index, (turn_id, claimed_status) in enumerate(task_claims.items(), start=1):
+            task_turn_outcome = {
+                "kind": "completed",
+                "reason": "completed",
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": claimed_status,
+                    "phase": "proposal",
+                    "retryPolicy": "never",
+                    "code": "stale_task_claim",
+                    "corrected": True,
+                    "proposalAttempts": 2,
+                },
+            }
+            if turn_id == "turn-ledger-failed":
+                task_turn_outcome["document_mutation_outcome"] = {
+                    "version": 1,
+                    "status": "applied",
+                    "code": "stale_snake_case_claim",
+                }
+            await storage.create_agent_task(
+                AgentTaskRecord(
+                    task_id=turn_id,
+                    session_key=session_key,
+                    agent_id="main",
+                    source_kind="webui",
+                    queue_mode="followup",
+                    run_kind="session_turn",
+                    status=AgentTaskStatus.SUCCEEDED,
+                    started_at=index * 10,
+                    finished_at=index * 10 + 5,
+                    details={"turn_id": turn_id, "turn_outcome": task_turn_outcome},
+                )
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        by_turn = {item["turn_id"]: item for item in result["turn_outcomes"]}
+
+        assert set(by_turn) == {
+            "turn-ledger-applied",
+            "turn-ledger-failed",
+            "turn-ledger-ambiguous",
+            "turn-ledger-reserved",
+        }
+        applied = by_turn["turn-ledger-applied"]["outcome"]["documentMutationOutcome"]
+        assert applied["status"] == "applied"
+        assert applied["retryPolicy"] == "never"
+        assert applied["attemptId"] == applied_attempt.mutation_attempt_id
+        assert applied["changeSetId"] == applied_attempt.change_set_id
+        assert applied["resultRevisionId"] == applied_attempt.revision_id
+        assert applied["corrected"] is True
+        assert applied["proposalAttempts"] == 2
+
+        failed = by_turn["turn-ledger-failed"]["outcome"]["documentMutationOutcome"]
+        assert failed["status"] == "not_applied"
+        assert failed["retryPolicy"] == "new_turn"
+        assert failed["code"] == failed_attempt.failure_code
+        assert failed["attemptId"] == failed_attempt.mutation_attempt_id
+        assert "document_mutation_outcome" not in by_turn["turn-ledger-failed"]["outcome"]
+
+        ambiguous = by_turn["turn-ledger-ambiguous"]["outcome"]["documentMutationOutcome"]
+        assert ambiguous["status"] == "ambiguous"
+        assert ambiguous["retryPolicy"] == "reconcile"
+        assert ambiguous["code"] == ambiguous_attempt.failure_code
+
+        reserved_row = by_turn["turn-ledger-reserved"]
+        assert reserved_row["task_id"] is None
+        assert reserved_row["status"] == "unknown"
+        reserved = reserved_row["outcome"]["documentMutationOutcome"]
+        assert reserved["status"] == "ambiguous"
+        assert reserved["retryPolicy"] == "reconcile"
+        assert reserved["code"] == "document_mutation_reconciliation_pending"
+        assert reserved["attemptId"] == reserved_attempt.mutation_attempt_id
+    finally:
+        await service.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "history-usage-barrier.db"))
     await storage.connect()
@@ -2175,6 +2373,47 @@ async def test_chat_history_prefers_attachment_display_text() -> None:
     msg = result["messages"][0]
     assert msg["text"] == ""
     assert msg["attachments"][0]["name"] == "image.png"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_strips_legacy_ids_from_missing_attachment_placeholders() -> None:
+    entry = TranscriptEntry(
+        session_id="session-1",
+        session_key="agent:main:webchat:test",
+        role="user",
+        content=json.dumps(
+            {
+                "text": "Inspect the unavailable attachment.",
+                "attachments": [
+                    {
+                        "attachment_id": "att_legacy_unaddressable",
+                        "name": "missing.pdf",
+                        "mime": "application/pdf",
+                        "size": 12,
+                        "missing_reason": "attachment persistence disabled",
+                    }
+                ],
+            }
+        ),
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test"},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=_FakeSessionManager([entry]),
+        ),
+    )
+
+    assert result["messages"][0]["attachments"] == [
+        {
+            "name": "missing.pdf",
+            "mime": "application/pdf",
+            "size": 12,
+            "missing_reason": "attachment persistence disabled",
+        }
+    ]
 
 
 @pytest.mark.asyncio

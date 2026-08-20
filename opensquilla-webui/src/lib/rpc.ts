@@ -9,7 +9,7 @@ export interface RpcErrorDetail {
   details?: unknown;
   retryable?: boolean;
   retry_after_ms?: number;
-  accepted?: boolean;
+  accepted?: boolean | null;
 }
 
 export interface RpcClientError extends Error {
@@ -17,7 +17,7 @@ export interface RpcClientError extends Error {
   details?: unknown;
   retryable?: boolean;
   retry_after_ms?: number;
-  accepted?: boolean;
+  accepted?: boolean | null;
 }
 
 export type RpcTerminationAction = 'reject' | 'reconnect';
@@ -54,6 +54,25 @@ export class RpcAbortError extends Error implements RpcClientError {
   constructor(readonly method: string) {
     super(`${method} was aborted`);
     this.name = 'RpcAbortError';
+  }
+}
+
+/**
+ * A connection failure with an explicit request-acceptance boundary.
+ *
+ * `false` means no request frame reached `WebSocket.send()`. `null` means the
+ * frame may have reached the Gateway, so a mutation must resolve its original
+ * request identity before it can safely issue another write.
+ */
+export class RpcTransportError extends Error implements RpcClientError {
+  readonly code = 'RPC_TRANSPORT_ERROR';
+
+  constructor(
+    message: string,
+    readonly accepted: boolean | null
+  ) {
+    super(message);
+    this.name = 'RpcTransportError';
   }
 }
 
@@ -176,7 +195,7 @@ export class RpcClient {
     this._startLifecycleWatch();
     this._clearReconnectTimer();
     if (this._ws) {
-      this._retireCurrentSocket(new Error('Connection replaced'), false);
+      this._retireCurrentSocket(new RpcTransportError('Connection replaced', null), false);
     }
     this._doConnect();
   }
@@ -185,8 +204,8 @@ export class RpcClient {
     this._autoReconnect = false;
     this._stopLifecycleWatch();
     this._clearReconnectTimer();
-    this._retireCurrentSocket(new Error('Disconnected'), false);
-    this._rejectAllPending(new Error('Disconnected'));
+    this._retireCurrentSocket(new RpcTransportError('Disconnected', null), false);
+    this._rejectAllPending(new RpcTransportError('Disconnected', null));
     this._setState('disconnected');
   }
 
@@ -199,7 +218,7 @@ export class RpcClient {
       const socket = this._ws;
       const generation = this._socketGeneration;
       if (!socket || socket.readyState !== WebSocket.OPEN) {
-        reject(new Error('Not connected'));
+        reject(new RpcTransportError('Not connected', false));
         return;
       }
       if (options.signal?.aborted) {
@@ -264,8 +283,10 @@ export class RpcClient {
       try {
         socket.send(frame);
       } catch (error) {
-        const sendError =
-          error instanceof Error ? error : new Error('Failed to send RPC request');
+        const sendError = new RpcTransportError(
+          error instanceof Error ? error.message : 'Failed to send RPC request',
+          false
+        );
         this._rejectPending(id, sendError, generation);
         this._recycleConnection(generation, sendError);
         return;
@@ -527,7 +548,10 @@ export class RpcClient {
       this._clearWakeProbe(generation);
       this._stopPing();
       this._stopTickWatch();
-      this._rejectPendingForGeneration(generation, new Error('Connection closed'));
+      this._rejectPendingForGeneration(
+        generation,
+        new RpcTransportError('Connection closed', null)
+      );
       this._setState('disconnected');
       this._scheduleReconnect();
     };
@@ -618,7 +642,11 @@ export class RpcClient {
     ++this._socketGeneration;
     this._stopPing();
     this._stopTickWatch();
-    this._rejectPendingForGeneration(generation, error);
+    // The request that triggered retirement has already been removed. Every
+    // remaining request may have reached the Gateway, even when the triggering
+    // send itself was rejected before acceptance.
+    const pendingError = new RpcTransportError(error.message, null);
+    this._rejectPendingForGeneration(generation, pendingError);
     this._setState('disconnected');
     try {
       socket.close();

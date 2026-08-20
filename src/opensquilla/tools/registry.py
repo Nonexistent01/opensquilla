@@ -606,6 +606,7 @@ def tool(
     *,
     plan_access: PlanAccess = PlanAccess.DENY,
     terminates_turn: bool = False,
+    terminal_response_field: str | None = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
     allow_string_item_schema_projection: bool = False,
 ) -> Any:
@@ -634,6 +635,7 @@ def tool(
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
             plan_access=plan_access,
             terminates_turn=terminates_turn,
+            terminal_response_field=terminal_response_field,
             allow_string_item_schema_projection=allow_string_item_schema_projection,
         )
         target = registry if registry is not None else _default_registry

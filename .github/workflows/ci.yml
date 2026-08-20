@@ -792,7 +792,7 @@ jobs:
     needs: classify-changes
     if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.windows_full_required == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -1259,7 +1259,7 @@ jobs:
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               if [[ "${RUNNER_OS}" == "macOS" ]]; then
@@ -1289,7 +1289,7 @@ jobs:
               entries=(
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               ;;

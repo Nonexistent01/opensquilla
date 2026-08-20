@@ -11,6 +11,7 @@ import type {
   ChatHistoryResponse,
 } from '@/types/rpc'
 import type { StatusPart } from '@/types/parts'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
 import {
   historyWindowsOverlap,
@@ -40,6 +41,7 @@ import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
+import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
 
 type RpcClient = {
   policy?: Record<string, unknown> | null
@@ -756,6 +758,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.tool_calls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments(msg.attachments, { messageId }),
+      promptAnnotations: (msg.promptAnnotations || msg.prompt_annotations || [])
+        .map(normalizePromptAnnotationSnapshot)
+        .filter((item): item is PromptAnnotationSnapshot => item !== null)
+        .sort((left, right) => left.sentOrder - right.sentOrder),
       provenanceKind: msg.provenance_kind || '',
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
