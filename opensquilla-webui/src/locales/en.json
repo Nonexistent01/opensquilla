@@ -3669,7 +3669,7 @@
       "ensembleFallbackUsed": "fallback used",
       "ensembleFallbackReason": "fallback · {reason}",
       "ensembleRouterPoolHidden": "router pool hidden",
-      "ensembleTokens": "{count} tok",
+      "ensembleTokens": "{count} token",
       "ensembleUsed": "used",
       "ensembleFailed": "failed",
       "ensembleQuorumSkipped": "threshold met · skipped",
