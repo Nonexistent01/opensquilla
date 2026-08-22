@@ -86,8 +86,23 @@
         />
       </button>
     </div>
-    <div v-else-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
-    <div v-else-if="item.type === 'interrupt'" class="run-trace__interrupt">
+    <div
+      v-else-if="item.type === 'text'"
+      class="msg-ai-text"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+      v-html="item.html"
+    />
+    <div
+      v-else-if="item.type === 'interrupt'"
+      class="run-trace__interrupt"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'interrupt' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+    >
       <slot name="interrupt" :part="item.part" />
     </div>
     <button
@@ -131,7 +146,7 @@
                  secondary ("2 web actions"), so the raw call-count pill would
                  repeat it. -->
             <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
-            <span v-if="item.group.secondary" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <span v-if="item.group.secondary && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ item.group.secondary }}</span>
             <Icon
               v-if="presentation === 'activity'"
               class="step-chevron tool-row__activity-arrow"
@@ -151,7 +166,15 @@
             tag="div"
             class="step-group-members"
           >
-            <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+            <div
+              v-for="call in item.group.calls"
+              :key="call.renderKey"
+              class="tool-row-wrap"
+              :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+              :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+              :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+              :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+            >
               <button
                 type="button"
                 class="tool-row tool-row--member"
@@ -170,7 +193,7 @@
                 />
                 <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
                 <span class="tool-row__label tool-row__label--member">{{ call.displayName }}</span>
-                <span v-if="resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
+                <span v-if="(!call.isRunning || callOpen(call)) && resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
                 <Icon
                   v-if="presentation === 'activity' && callHasDetails(call)"
                   class="step-chevron tool-row__activity-arrow"
@@ -213,7 +236,15 @@
           </TransitionGroup>
         </template>
         <template v-else>
-          <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+          <div
+            v-for="call in item.group.calls"
+            :key="call.renderKey"
+            class="tool-row-wrap"
+            :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+            :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+            :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+            :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+          >
             <button
               type="button"
               class="tool-row"
@@ -232,7 +263,7 @@
               />
               <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
               <span class="tool-row__label">{{ item.group.label }}</span>
-              <span v-if="singleCallSecondary(item.group, call)" class="tool-row__arg">
+              <span v-if="(!call.isRunning || callOpen(call)) && singleCallSecondary(item.group, call)" class="tool-row__arg">
                 {{ singleCallSecondary(item.group, call) }}
               </span>
               <Icon
