@@ -1,4 +1,4 @@
-"""Idempotent direct-update migration for legacy sandbox state."""
+﻿"""Idempotent direct-update migration for legacy sandbox state."""
 
 from __future__ import annotations
 
@@ -428,11 +428,36 @@ def _acl_path_hash(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
 
+def _windows_powershell_exe() -> str:
+    """Return the absolute path to Windows PowerShell 5.1 (powershell.exe).
+
+    The ACL migration script relies on .NET Framework-only APIs such as
+    ``[System.IO.Directory]::SetAccessControl`` and
+    ``[System.IO.File]::SetAccessControl``, which do not exist in PowerShell 7
+    (.NET Core / ``pwsh``). On systems where ``pwsh`` is installed, a bare
+    ``powershell`` on PATH may resolve to ``pwsh``, or be shadowed by a
+    ``powershell.exe`` alias that points at ``pwsh``. Pin the well-known
+    Windows PowerShell location instead of trusting PATH lookup.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates = (
+        os.path.join(system_root, "SysNative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    # Last resort: assume PATH resolves to Windows PowerShell 5.1, not pwsh.
+    return "powershell"
+
+
 def _windows_acl_shells() -> tuple[str, ...]:
-    preferred = shutil.which("pwsh")
-    fallback = shutil.which("powershell")
+    # Windows PowerShell 5.1 is required for the .NET Framework-only SetAccessControl
+    # APIs used by the ACL script; pwsh (.NET Core) must only be a fallback.
+    preferred = _windows_powershell_exe()
+    fallback = shutil.which("pwsh")
     shells = tuple(item for item in (preferred, fallback) if item is not None)
-    return shells or ("powershell",)
+    return shells or (preferred,)
 
 
 def _protect_windows_acl_batch(
